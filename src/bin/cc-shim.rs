@@ -38,6 +38,13 @@ const OUT_FILES: &str = "CC_SHIM_OUT_FILES";
 /// test can answer that probe without changing what the others see.
 const STDOUT: &str = "CC_SHIM_STDOUT";
 
+/// Opts the shim into creating the object and Make-style depfile named by a
+/// compile invocation. Used by dependency-tracking integration tests.
+const CREATE_COMPILE_OUTPUTS: &str = "CC_SHIM_CREATE_COMPILE_OUTPUTS";
+
+/// Optional additional path to include in a generated Make-style depfile.
+const EXTRA_DEPENDENCY: &str = "CC_SHIM_EXTRA_DEPENDENCY";
+
 /// Create the file this invocation should record its arguments in, if any.
 ///
 /// With the `parallel` feature several compile commands start at once and look
@@ -107,6 +114,47 @@ fn record(program: &str, args: &[String]) {
     });
 }
 
+fn escape_makefile_path(path: &str) -> String {
+    path.replace('\\', "\\\\")
+        .replace(' ', "\\ ")
+        .replace('#', "\\#")
+}
+
+fn create_compile_outputs(args: &[String]) {
+    if env::var_os(CREATE_COMPILE_OUTPUTS).is_none() {
+        return;
+    }
+
+    let argument_after = |flag: &str| {
+        args.windows(2)
+            .find(|arguments| arguments[0] == flag)
+            .map(|arguments| arguments[1].as_str())
+    };
+    let (Some(object), Some(depfile), Some(source)) =
+        (argument_after("-o"), argument_after("-MF"), args.last())
+    else {
+        return;
+    };
+
+    File::create(object)
+        .unwrap_or_else(|error| panic!("can't create compiler output {object}: {error}"));
+
+    let mut dependencies = vec![source.clone()];
+    if let Some(extra) = env::var_os(EXTRA_DEPENDENCY) {
+        dependencies.push(extra.to_string_lossy().into_owned());
+    }
+    let dependencies = dependencies
+        .iter()
+        .map(|path| escape_makefile_path(path))
+        .collect::<Vec<_>>()
+        .join(" ");
+    std::fs::write(
+        depfile,
+        format!("{}: {dependencies}\n", escape_makefile_path(object)),
+    )
+    .unwrap_or_else(|error| panic!("can't create dependency file {depfile}: {error}"));
+}
+
 fn main() -> ExitCode {
     let argv = env::args().collect::<Vec<_>>();
     let (program, args) = argv.split_first().expect("Unexpected empty args");
@@ -165,6 +213,8 @@ fn main() -> ExitCode {
     if let Ok(message) = env::var("CC_SHIM_STDERR") {
         eprintln!("{program}: {message}");
     }
+
+    create_compile_outputs(args);
 
     // Create a file used by some tests. Only the invocations a build actually
     // performs are asked to do this; probes are not archiving anything.
