@@ -3809,31 +3809,45 @@ impl Build {
         // create on the first iteration instead of appending.
         let _ = fs::remove_file(dst);
 
-        // Add objects to the archive in limited-length batches. This helps keep
-        // the length of the command line within a reasonable length to avoid
-        // blowing system limits on limiting platforms like Windows.
-        //
         // Optimistically try the `D` (deterministic) ar modifier, which zeros
         // out timestamps, UIDs, and GIDs. If the archiver doesn't support it,
         // we remember and stop trying for subsequent batches.
         // (`None` -> haven't probed yet)
         let mut deterministic_ar: Option<bool> = None;
 
-        let mut objs = objs
+        let all_objs: Vec<&Path> = objs
             .chain(self.objects.iter().map(core::ops::Deref::deref))
-            .peekable();
+            .collect();
+        let mut objs = all_objs.iter().copied().peekable();
+        let target = self.get_target()?;
+        let (_, program, _, _) = self.try_get_archiver_and_flags()?;
 
         // libtool can't add to an existing library, so it gets every object
         // in one call instead of in batches. See `assemble_libtool`.
-        let libtool = is_libtool(&self.try_get_archiver_and_flags()?.1);
+        let libtool = is_libtool(&program);
         let mut libtool_objs = Vec::new();
         if libtool {
             libtool_objs.extend(objs);
             self.assemble_libtool(dst, &libtool_objs)?;
         } else {
+            // Add objects to the archive in batches that keep the command line
+            // within system limits; each batch rewrites the whole archive. lib.exe
+            // and llvm-lib on a Windows host take all objects through a response
+            // file, unless an object path is not valid Unicode. Other Windows
+            // archivers (including wrappers around lib.exe), and MSVC-style
+            // archivers elsewhere (msvc-wine), keep 4000 characters (#1689,
+            // leaving room for wrapper scripts); other hosts use
+            // `ARCHIVE_BATCH_LEN`.
+            let batch_len = if uses_response_file(&target, &program, all_objs.iter().copied()) {
+                usize::MAX
+            } else if cfg!(windows) || is_lib_exe(&target, &program) {
+                4000
+            } else {
+                ARCHIVE_BATCH_LEN
+            };
             let mut batch = Vec::new();
             while objs.peek().is_some() {
-                let mut remaining_len = 4000;
+                let mut remaining_len = batch_len;
                 while let Some(path) =
                     objs.next_if(|peek| batch.is_empty() || peek.as_os_str().len() <= remaining_len)
                 {
@@ -3863,7 +3877,6 @@ impl Build {
             }
         }
 
-        let target = self.get_target()?;
         if target.env == "msvc" {
             // The Rust compiler will look for libfoo.a and foo.lib, but the
             // MSVC linker will also be passed foo.lib, so be sure that both
@@ -3925,10 +3938,7 @@ impl Build {
         let target = self.get_target()?;
 
         let (mut cmd, program, any_flags, any_args) = self.try_get_archiver_and_flags()?;
-        let is_llvm_ar = program.file_name().map_or(false, |name| {
-            name.to_string_lossy().contains_ignore_ascii_case("llvm-ar")
-        });
-        if target.env == "msvc" && !is_llvm_ar {
+        if is_lib_exe(&target, &program) {
             // NOTE: -out: here is an I/O flag, and so must be included even if $ARFLAGS/ar_flag is
             // in use. -nologo on the other hand is just a regular flag, and one that we'll skip if
             // the caller has explicitly dictated the flags they want. See
@@ -3956,18 +3966,34 @@ impl Build {
                     && !any_args
                     && (program.is_absolute() || program.components().count() == 1)
             });
+            let mut members: Vec<PathBuf> = Vec::with_capacity(objs.len());
             if let Some(dir) = dir {
                 let current_dir = env::current_dir()?;
                 cmd.current_dir(dir);
                 for obj in objs {
-                    match obj.strip_prefix(dir) {
-                        Ok(relative) => cmd.arg(relative),
-                        Err(_) if obj.is_relative() => cmd.arg(current_dir.join(obj)),
-                        Err(_) => cmd.arg(obj),
-                    };
+                    members.push(match obj.strip_prefix(dir) {
+                        Ok(relative) => relative.to_path_buf(),
+                        Err(_) if obj.is_relative() => current_dir.join(obj),
+                        Err(_) => obj.to_path_buf(),
+                    });
                 }
             } else {
-                cmd.args(objs);
+                members.extend(objs.iter().map(|obj| obj.to_path_buf()));
+            }
+            if uses_response_file(&target, &program, members.iter().map(PathBuf::as_path)) {
+                // Without a BOM, lib.exe reads the response file in the ANSI code page.
+                let response_file = dst.with_extension("rsp");
+                let contents: String = members
+                    .iter()
+                    .filter_map(|member| member.to_str())
+                    .map(|member| format!("\"{member}\"\n"))
+                    .collect();
+                fs::write(&response_file, format!("\u{feff}{contents}"))?;
+                let mut response_arg = OsString::from("@");
+                response_arg.push(&response_file);
+                cmd.arg(response_arg);
+            } else {
+                cmd.args(&members);
             }
             run(&mut cmd, &self.cargo_output)?;
         } else {
@@ -6090,6 +6116,42 @@ fn map_darwin_target_from_rust_to_compiler_architecture<'a>(target: &TargetInfo<
         "x86_64h" => "x86_64h",
         arch => arch,
     }
+}
+
+// Half of the 128 KiB that Linux guarantees for arguments and environment together.
+const ARCHIVE_BATCH_LEN: usize = 64 * 1024;
+
+fn is_lib_exe(target: &TargetInfo<'_>, archiver: &Path) -> bool {
+    let is_llvm_ar = archiver.file_name().map_or(false, |name| {
+        name.to_string_lossy().contains_ignore_ascii_case("llvm-ar")
+    });
+    target.env == "msvc" && !is_llvm_ar
+}
+
+/// Whether `archiver` is lib.exe or llvm-lib, which read objects from a response file.
+/// Wrappers and other archivers are not assumed to understand `@file`.
+fn is_known_lib_exe(archiver: &Path) -> bool {
+    let name = archiver
+        .file_name()
+        .and_then(OsStr::to_str)
+        .map(str::to_ascii_lowercase);
+    matches!(
+        name.as_deref(),
+        Some("lib" | "lib.exe" | "llvm-lib" | "llvm-lib.exe")
+    )
+}
+
+/// Whether `objs` go to the archiver through a UTF-8 response file: only for a known
+/// lib.exe on a Windows host, and only if every path is valid Unicode.
+fn uses_response_file<'a>(
+    target: &TargetInfo<'_>,
+    archiver: &Path,
+    objs: impl IntoIterator<Item = &'a Path>,
+) -> bool {
+    cfg!(windows)
+        && is_lib_exe(target, archiver)
+        && is_known_lib_exe(archiver)
+        && objs.into_iter().all(|obj| obj.to_str().is_some())
 }
 
 fn is_arm(target: &TargetInfo<'_>) -> bool {

@@ -89,6 +89,7 @@ const AR_DETECTION_PROBES: &str = "ar-detection-probe";
 const CPP_STDLIB_PROBES: &str = "cpp-stdlib-probe";
 const PROBE_SLOTS: usize = 4;
 
+#[derive(Debug)]
 pub struct Execution {
     /// The program the shim was invoked as (`argv[0]`).
     pub program: PathBuf,
